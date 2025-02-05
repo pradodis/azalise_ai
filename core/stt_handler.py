@@ -1,10 +1,13 @@
 from flask import Flask, request, jsonify
 import speech_recognition as sr
 import io
-import wave
 import logging
-import os
 import sys
+from pathlib import Path
+
+# Import settings
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+from config.settings import STT_METHOD
 
 # Configure logging
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
@@ -16,21 +19,19 @@ app.logger.disabled = True
 
 recognizer = sr.Recognizer()
 
+def transcribe_with_google(audio):
+    return recognizer.recognize_google(audio, language='pt-BR')
+
 @app.route('/transcribe', methods=['POST'])
 def transcribe_audio():
     try:
-        # Get audio data from request
         audio_data = request.get_data()
-        
-        # Create WAV file in memory
         wav_buffer = io.BytesIO(audio_data)
         
-        # Convert to format compatible with speech_recognition
         with sr.AudioFile(wav_buffer) as source:
             audio = recognizer.record(source)
-            
-        # Perform speech recognition
-        text = recognizer.recognize_google(audio, language='pt-BR')
+        
+        text = transcribe_with_google(audio)
         return jsonify({"success": True, "text": text})
         
     except Exception as e:

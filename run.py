@@ -1,25 +1,18 @@
 from colorama import init, Fore, Style
 from pynput import keyboard
 import threading
-import time
 import io
 import wave
 import pyaudio
 import requests
-import json
 from TTS.api import TTS
-import torch
-import tempfile
-import os
+from settings import API_CONFIG, AUDIO_DEVICE_INPUT, AUDIO_DEVICE_OUTPUT, TTS_SERVER_URL, STT_SERVER_URL, COMMON_INSTRUCTION
 
 history = []
-commom_instuction = "Responda de forma suscinta e objetiva. Não use emojis. A resposta deve ter entre 5 e 15 palavras. A resposta deve ser em portugues brasileiro. A conversa deve ocorrer com naturalidade. A AI é cabeça dura e tem gênio forte. A AI deve interpretar uma garota de 20 anos que é uma grande amiga."
-audio_device_code_output = 40  # Change this to your desired audio device code
-audio_device_code_input = 1  # Change this to your desired audio device code
-
+# Remove old config variables and use settings instead
 class VoiceRecorder:
     def __init__(self):
-        init()  # Initialize colorama
+        init()
         self.is_recording = False
         self.audio_data = []
         self.recording_thread = None
@@ -29,19 +22,17 @@ class VoiceRecorder:
         self.FORMAT = pyaudio.paInt16
         self.CHANNELS = 1
         self.RATE = 44100
-        self.output_device_index = None
         
-        self.output_device_index = audio_device_code_output
-        self.api_url = "http://127.0.0.1:5000/v1/chat/completions"
+        self.output_device_index = AUDIO_DEVICE_OUTPUT
+        self.api_config = API_CONFIG
+        self.api_url = self.api_config["local_api"]["url"] if self.api_config["api_type"] == "local" else self.api_config["openai_api"]["url"]
+        self.tts_server_url = TTS_SERVER_URL
 
-        # Simple initialization message
+        #self.list_audio_devices()
+
         print("Sistema inicializado com sucesso!")
         print("Pressione e segure '0' para gravar, solte para converter para texto.")
         print("Pressione 'ESC' para sair.\n")
-        
-        # Get device
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.tts_server_url = "http://localhost:5501/synthesize"
 
     def list_audio_devices(self):
         print("\nAvailable Audio Input Devices:")
@@ -63,7 +54,7 @@ class VoiceRecorder:
                                 channels=self.CHANNELS,
                                 rate=self.RATE,
                                 input=True,
-                                input_device_index=audio_device_code_input,  # Add input device specification
+                                input_device_index=AUDIO_DEVICE_INPUT,
                                 frames_per_buffer=self.CHUNK)
         self.recording_thread = threading.Thread(target=self._record)
         self.recording_thread.start()
@@ -98,7 +89,7 @@ class VoiceRecorder:
         # Send audio data to STT server
         try:
             response = requests.post(
-                'http://localhost:5502/transcribe',
+                STT_SERVER_URL,
                 data=wav_buffer.getvalue(),
                 headers={'Content-Type': 'audio/wav'}
             )
@@ -115,12 +106,21 @@ class VoiceRecorder:
                             "Content-Type": "application/json"
                         }
 
-                        history.append({"role": "user", "content": texto + commom_instuction})
-                        data = {
-                            "messages": history,
-                            "mode": "instruct",
-                            "model": "Meta8BQ4",
-                        }
+                        history.append({"role": "user", "content": texto + COMMON_INSTRUCTION})
+                        
+                        if self.api_config["api_type"] == "local":
+                            data = {
+                                "messages": history,
+                                "mode": "instruct",
+                                "model": self.api_config["local_api"]["model"],
+                            }
+                        else:
+                            headers["Authorization"] = f"Bearer {self.api_config['openai_api']['api_key']}"
+                            data = {
+                                "messages": history,
+                                "model": self.api_config["openai_api"]["model"],
+                                "temperature": 0.7
+                            }
                                     
                         response = requests.post(self.api_url, headers=headers, json=data)
                         
@@ -150,41 +150,12 @@ class VoiceRecorder:
             # Send request to TTS server
             response = requests.post(
                 self.tts_server_url,
-                json={"text": text},
-                stream=True
+                json={"text": text}
             )
             
-            if response.status_code == 200:
-                # Create temporary file to store the audio
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        if chunk:
-                            temp_file.write(chunk)
-                    temp_file_path = temp_file.name
-
-                # Play the audio
-                wf = wave.open(temp_file_path, 'rb')
-                stream = self.p.open(
-                    format=self.p.get_format_from_width(wf.getsampwidth()),
-                    channels=wf.getnchannels(),
-                    rate=wf.getframerate(),
-                    output=True,
-                    output_device_index=self.output_device_index
-                )
-                
-                data = wf.readframes(self.CHUNK)
-                while data:
-                    stream.write(data)
-                    data = wf.readframes(self.CHUNK)
-                
-                stream.stop_stream()
-                stream.close()
-                wf.close()
-                
-                # Clean up temporary file
-                os.unlink(temp_file_path)
-            else:
+            if response.status_code != 200:
                 print(f"Error from TTS server: {response.status_code}")
+                print(f"Response: {response.text}")
                 
         except Exception as e:
             print(f"Error in speech synthesis: {e}")

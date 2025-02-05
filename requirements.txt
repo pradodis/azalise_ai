@@ -1,0 +1,14 @@
+colorama>=0.4.6
+pynput>=1.7.6
+pyaudio>=0.2.13
+requests>=2.28.2
+torch>=2.0.0
+TTS>=0.14.0
+Flask>=2.0.1
+SpeechRecognition>=3.8.1
+numpy>=1.21.0
+wave>=0.0.2
+Werkzeug>=2.0.1
+pywin32>=305; platform_system == "Windows"
+pydub>=0.25.1
+openai>=0.27.0

@@ -1,3 +1,3 @@
 # File: /voice-assistant/voice-assistant/src/core/__init__.py
 
-# This file is intentionally left blank.
+# Empty file to make the directory a Python package
