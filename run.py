@@ -6,7 +6,7 @@ import wave
 import pyaudio
 import requests
 from TTS.api import TTS
-from settings import API_CONFIG, AUDIO_DEVICE_INPUT, AUDIO_DEVICE_OUTPUT, TTS_SERVER_URL, STT_SERVER_URL, COMMON_INSTRUCTION
+from config.settings import API_CONFIG, AUDIO_DEVICE_INPUT, AUDIO_DEVICE_OUTPUT, TTS_SERVER_URL, STT_SERVER_URL, COMMON_INSTRUCTION
 
 history = []
 # Remove old config variables and use settings instead

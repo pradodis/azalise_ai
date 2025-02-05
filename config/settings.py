@@ -17,7 +17,7 @@ API_CONFIG = {
     },
     "openai_api": {
         "url": "https://api.openai.com/v1/chat/completions",
-        "api_key": "CHAVE_API_OPENAI",
+        "api_key": "OPEN_AI_API_KEY", #Adjust your OpenAI API key
         "model": "gpt-4o-mini"
     }
 }

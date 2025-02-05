@@ -3,11 +3,6 @@ import speech_recognition as sr
 import io
 import logging
 import sys
-from pathlib import Path
-
-# Import settings
-sys.path.append(str(Path(__file__).resolve().parents[1]))
-from config.settings import STT_METHOD
 
 # Configure logging
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
