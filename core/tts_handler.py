@@ -1,6 +1,6 @@
 import sys, os, logging, threading, queue, tempfile, time
 import torch, numpy as np, soundfile as sf, librosa, sounddevice as sd
-from flask import Flask, request
+from flask import Flask, request, Response, stream_with_context
 from TTS.api import TTS
 from pathlib import Path
 
@@ -9,6 +9,9 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 from config.settings import AUDIO_DEVICE_OUTPUT
 
 app = Flask(__name__)
+
+# Add connection tracking
+client_connected = False
 
 class TextToSpeechHandler:
     def __init__(self, audio_device_output=None):
@@ -20,6 +23,10 @@ class TextToSpeechHandler:
         self.target_sample_rate = self._get_device_sample_rate()
         self.audio_queue = queue.Queue()
         self.is_playing = False
+        self.chunk_size = 12 # Number of frames to stream at once
+        self.chunk_samples = 1024  # Tamanho do chunk para streaming
+        self.stream_buffer = queue.Queue()
+        self.current_stream = None
         threading.Thread(target=self._process_queue, daemon=True).start()
 
     def _get_device_sample_rate(self):
@@ -49,6 +56,63 @@ class TextToSpeechHandler:
             if os.path.exists(temp_file): os.unlink(temp_file)
             self.logger.error(f"Synthesis failed: {e}")
             return None
+
+    def stream_synthesis(self, text, speaker_wav):
+        try:
+            # Gera o áudio completo primeiro
+            wav = self.tts.tts(text=text, speaker_wav=speaker_wav, language="pt")
+            
+            # Converte tensor PyTorch para numpy array
+            wav = wav.numpy() if hasattr(wav, 'numpy') else np.array(wav)
+            
+            # Resampling para a taxa do dispositivo se necessário
+            if self.target_sample_rate != 24000:  # XTTS usa 22050Hz
+                wav = librosa.resample(wav, orig_sr=24000, target_sr=self.target_sample_rate)
+            
+            wav = np.clip(wav, -1.0, 1.0).astype(np.float32)
+            
+            # Converte para stereo se necessário
+            if len(wav.shape) == 1:
+                wav = np.column_stack((wav, wav))
+            
+            # Divide o áudio em chunks e coloca no buffer
+            for i in range(0, len(wav), self.chunk_samples):
+                chunk = wav[i:i + self.chunk_samples]
+                if len(chunk) < self.chunk_samples:
+                    # Pad último chunk se necessário
+                    chunk = np.pad(chunk, ((0, self.chunk_samples - len(chunk)), (0, 0)))
+                self.stream_buffer.put(chunk)
+            
+            # Marca o fim do stream
+            self.stream_buffer.put(None)
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Streaming synthesis failed: {e}")
+            return False
+
+    def _stream_audio(self):
+        try:
+            with sd.OutputStream(
+                samplerate=self.target_sample_rate,  # Usa a taxa do dispositivo
+                channels=2,
+                device=self.audio_device,
+                dtype=np.float32,
+                latency='low'
+            ) as stream:
+                while True:
+                    chunk = self.stream_buffer.get()
+                    if chunk is None:  # End of stream
+                        break
+                    stream.write(chunk)
+                    self.stream_buffer.task_done()
+        except Exception as e:
+            self.logger.error(f"Streaming playback error: {e}")
+
+    def start_streaming(self):
+        if self.current_stream is None or not self.current_stream.is_alive():
+            self.current_stream = threading.Thread(target=self._stream_audio, daemon=True)
+            self.current_stream.start()
 
     def _process_queue(self):
         while True:
@@ -92,10 +156,30 @@ def synthesize_speech():
         speaker_wav = data.get('speaker_wav', "D:\\oobabooga\\text-generation-webui-2.4\\extensions\\coqui_tts\\voices\\Mini_Dina.wav")
         if not text: return {"error": "No text provided"}, 400
         
-        audio_files = tts_handler.synthesize(text, speaker_wav)
-        return ({"message": "Audio synthesis started", "files_queued": len(audio_files)}, 200) if audio_files else ({"error": "Synthesis failed"}, 500)
+        # Start streaming synthesis
+        tts_handler.start_streaming()
+        success = tts_handler.stream_synthesis(text, speaker_wav)
+        
+        return ({"message": "Streaming synthesis started"}, 200) if success else ({"error": "Synthesis failed"}, 500)
     except Exception as e:
         return {"error": f"Server error: {str(e)}"}, 500
+
+@app.route('/', methods=['GET'])
+def health_check():
+    global client_connected
+    # Check if this is a new connection
+    if not client_connected:
+        print(f"{time.strftime('%H:%M:%S')} [TTS] Cliente conectado")
+        client_connected = True
+    return {"status": "healthy", "service": "TTS Server", "message": "Connection established"}, 200
+
+@app.errorhandler(500)
+def handle_error(e):
+    global client_connected
+    if client_connected:
+        print(f"{time.strftime('%H:%M:%S')} [TTS] Cliente desconectado")
+        client_connected = False
+    return {"error": str(e)}, 500
 
 tts_handler = TextToSpeechHandler(audio_device_output=AUDIO_DEVICE_OUTPUT)
 
@@ -103,5 +187,6 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     logging.getLogger('werkzeug').setLevel(logging.ERROR)
     sys.modules['flask.cli'].show_server_banner = lambda *x: None
-    print("\n[TTS] Server started successfully on http://localhost:5501")
+    print("\n[TTS] Servidor TTS iniciado com sucesso em http://localhost:5501")
+    print("[TTS] Aguardando conexões...")
     app.run(host='localhost', port=5501, debug=False, use_reloader=False)
