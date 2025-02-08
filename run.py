@@ -11,7 +11,7 @@ from TTS.api import TTS
 from config.settings import (API_CONFIG, AUDIO_DEVICE_INPUT, AUDIO_DEVICE_OUTPUT, 
                            TTS_SERVER_URL, STT_SERVER_URL, TTS_SYNTHESIS_URL, 
                            STT_TRANSCRIBE_URL, COMMON_INSTRUCTION, TIME_CHECK,
-                            FAKE_IA_RESPONSE,STT_CONFIG)
+                            STT_CONFIG,TTS_CONFIG, AUDIO_SERVER_URL)
 from time import perf_counter
 import matplotlib.pyplot as plt
 import os
@@ -28,25 +28,23 @@ class PerformanceMetrics:
         self.model_info = {
             'stt_model': STT_CONFIG["engine"] + " - " + STT_CONFIG["whisper"]["model"] if STT_CONFIG["engine"] == "whisper" else STT_CONFIG["engine"], 
             'ai_model': 'GPT-3.5' if API_CONFIG["api_type"] == "openai" else API_CONFIG.get('local_api', {}).get('model', 'Unknown'),
-            'tts_model': 'Coqui TTS'
+            'tts_model': TTS_CONFIG["engine"]
         }
     
     def report(self):
         return f"""Performance Metrics:
-        🎤 Recording Time: {self.recording_time:.2f}s
         🗣️ STT Time: {self.stt_time:.2f}s
         🤖 AI Response Time: {self.ai_time:.2f}s
         🔊 TTS Time: {self.tts_time:.2f}s
-        ⌚ Total Time: {(self.recording_time + self.stt_time + self.ai_time + self.tts_time):.2f}s
+        ⌚ Total Time: {(self.stt_time + self.ai_time + self.tts_time):.2f}s
         """
     
     def get_metrics_dict(self):
         return {
-            'recording_time': self.recording_time,
             'stt_time': self.stt_time,
             'ai_time': self.ai_time,
             'tts_time': self.tts_time,
-            'total_time': self.recording_time + self.stt_time + self.ai_time + self.tts_time,
+            'total_time': self.stt_time + self.ai_time + self.tts_time,
             'models': self.model_info
         }
 
@@ -92,6 +90,19 @@ class ServerConnection:
                 break
             time.sleep(5)
 
+    def disconnect(self):
+        try:
+            if self.is_connected:
+                response = requests.post(
+                    f"{self.url}/disconnect",
+                    headers={'X-Session-ID': self.session_id}
+                )
+                if response.status_code == 200:
+                    print(f"Desconectado do servidor {self.name}")
+                self.is_connected = False
+        except Exception as e:
+            print(f"Erro ao desconectar do servidor {self.name}: {str(e)}")
+
 class VoiceRecorder:
     def __init__(self):
         init()
@@ -112,6 +123,7 @@ class VoiceRecorder:
         # Initialize server connections
         self.tts_server = ServerConnection(TTS_SERVER_URL, "TTS")
         self.stt_server = ServerConnection(STT_SERVER_URL, "STT")
+        self.audio_server = ServerConnection(AUDIO_SERVER_URL, "AUDIO")
         
         # Start connection monitoring threads
         self.start_connection_monitors()
@@ -119,6 +131,7 @@ class VoiceRecorder:
         # Wait for initial connections
         self.tts_server.wait_for_connection()
         self.stt_server.wait_for_connection()
+        self.audio_server.wait_for_connection()
 
         self.metrics = PerformanceMetrics()
 
@@ -136,6 +149,7 @@ class VoiceRecorder:
 
         threading.Thread(target=monitor_connection, args=(self.tts_server,), daemon=True).start()
         threading.Thread(target=monitor_connection, args=(self.stt_server,), daemon=True).start()
+        threading.Thread(target=monitor_connection, args=(self.audio_server,), daemon=True).start()
 
     def list_audio_devices(self):
         print("\nAvailable Audio Input Devices:")
@@ -286,6 +300,49 @@ class VoiceRecorder:
         except Exception as e:
             print(f"Erro ao comunicar com servidor STT: {e}")
 
+
+    def _send_to_audio_server(self, file_path, priority=1):
+        """Send audio file to audio server asynchronously"""
+        def delete_file_with_retry(file_path, max_retries=3, delay=0.5):
+            """Helper function to retry file deletion"""
+            for attempt in range(max_retries):
+                try:
+                    if os.path.exists(file_path):
+                        os.unlink(file_path)
+                        return True
+                except PermissionError:
+                    if attempt < max_retries - 1:
+                        time.sleep(delay)
+                        continue
+                    return False
+            return False
+        def send_request():
+            try:
+                data = {
+                    "file_path": file_path,
+                    "priority": priority,
+                    "delete_after": True  # Let audio server handle file deletion
+                }
+                response = requests.post(
+                    f"{self.audio_server.url}/play", 
+                    json=data,
+                    headers={'X-Session-ID': self.audio_server.session_id}
+                )
+                if response.status_code == 200:
+                    print("Audio sent to server successfully")
+                else:
+                    print(f"Error sending audio to server: {response.status_code}")
+                    # Only attempt deletion if audio server failed
+                    if not delete_file_with_retry(file_path):
+                        print(f"Warning: Could not delete temporary file: {file_path}")
+            except Exception as e:
+                print(f"Error in send_request: {e}")
+                if not delete_file_with_retry(file_path):
+                    print(f"Warning: Could not delete temporary file: {file_path}")
+        
+        # Start async thread to send audio
+        threading.Thread(target=send_request, daemon=True).start()
+
     def _speak_response(self, text):
         if TIME_CHECK:
             tts_start = perf_counter()
@@ -296,28 +353,41 @@ class VoiceRecorder:
         try:
             # Send request to TTS server
             response = requests.post(
-                TTS_SYNTHESIS_URL,  # Usar URL específica para síntese
+                TTS_SYNTHESIS_URL,
                 json={"text": text}
             )
             
-            if response.status_code != 200:
+            if response.status_code == 200:
+                # Get synthesized audio file path
+                result = response.json()
+                audio_file = result.get('file_path')
+                if TIME_CHECK:
+                    self.metrics.tts_time = perf_counter() - tts_start
+                if audio_file:
+                    # Send to audio server asynchronously
+                    self._send_to_audio_server(audio_file)
+            else:
                 print(f"Error from TTS server: {response.status_code}")
                 print(f"Response: {response.text}")
                 
         except Exception as e:
             print(f"Error in speech synthesis: {e}")
-        if TIME_CHECK:
-            self.metrics.tts_time = perf_counter() - tts_start
 
-    def __del__(self):
+    def cleanup(self):
+        print("\nFinalizando conexões...")
+        self.tts_server.disconnect()
+        self.stt_server.disconnect()
+        self.audio_server.disconnect()
         if self.p:
             self.p.terminate()
+
+    def __del__(self):
+        self.cleanup()
 
 def save_performance_log(metrics_data, log_filename):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_entry = (
         f"Timestamp: {timestamp}\n"
-        f"Recording Time: {metrics_data['recording_time']:.2f}s\n"
         f"STT Time ({metrics_data['models']['stt_model']}): {metrics_data['stt_time']:.2f}s\n"
         f"AI Time ({metrics_data['models']['ai_model']}): {metrics_data['ai_time']:.2f}s\n"
         f"TTS Time ({metrics_data['models']['tts_model']}): {metrics_data['tts_time']:.2f}s\n"
@@ -331,14 +401,12 @@ def save_performance_log(metrics_data, log_filename):
 def generate_performance_chart(metrics_data):
     # Create data for the chart
     times = [
-        metrics_data['recording_time'],
         metrics_data['stt_time'],
         metrics_data['ai_time'],
         metrics_data['tts_time'],
         metrics_data['total_time']
     ]
     labels = [
-        'Recording\nTime',
         f'STT\n({metrics_data["models"]["stt_model"]})',
         f'AI\n({metrics_data["models"]["ai_model"]})',
         f'TTS\n({metrics_data["models"]["tts_model"]})',
@@ -390,13 +458,17 @@ def main():
 
     def on_release(key):
         if key == keyboard.Key.esc:
+            recorder.cleanup()  # Adicionar cleanup antes de sair
             return False
         if hasattr(key, 'vk') and key.vk == 96:  # 96 é o código virtual key do '0' do teclado numérico
             if recorder.is_recording:
                 recorder.stop_recording()
 
-    with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
-        listener.join()
+    try:
+        with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
+            listener.join()
+    finally:
+        recorder.cleanup()  # Garantir que cleanup seja chamado mesmo em caso de erro
 
 if __name__ == "__main__":
     main()

@@ -117,16 +117,29 @@ def health_check():
         
     return {"status": "healthy", "service": "STT Server", "message": "Connection established"}, 200
 
-@app.errorhandler(500)
-def handle_error(e):
-    global client_connected
-    session_id = request.headers.get('X-Session-ID')
-    if session_id and session_id in active_sessions:
+def cleanup_session(session_id):
+    if session_id in active_sessions:
         print(f"{time.strftime('%H:%M:%S')} [STT] Cliente desconectado (Session: {session_id})")
         del active_sessions[session_id]
-    if client_connected and not active_sessions:
-        print(f"{time.strftime('%H:%M:%S')} [STT] Todos os clientes desconectados")
-        client_connected = False
+        if not active_sessions:
+            global client_connected
+            print(f"{time.strftime('%H:%M:%S')} [STT] Todos os clientes desconectados")
+            client_connected = False
+
+@app.route('/disconnect', methods=['POST'])
+def disconnect():
+    session_id = request.headers.get('X-Session-ID')
+    if not session_id:
+        return jsonify({"success": False, "error": "No session ID provided"}), 400
+    
+    cleanup_session(session_id)
+    return jsonify({"success": True, "message": "Disconnected successfully"}), 200
+
+@app.errorhandler(500)
+def handle_error(e):
+    session_id = request.headers.get('X-Session-ID')
+    if session_id:
+        cleanup_session(session_id)
     return {"error": str(e)}, 500
 
 if __name__ == "__main__":
