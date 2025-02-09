@@ -1,14 +1,10 @@
-# Audio settings
-AUDIO_DEVICE_OUTPUT = 103
-AUDIO_DEVICE_INPUT = 1
-
 # STT Configuration
 STT_SERVER_URL = "http://localhost:5502"  # Removido /transcribe para usar na verificação de conexão
 STT_TRANSCRIBE_URL = "http://localhost:5502/transcribe"  # Nova URL específica para transcrição
 STT_CONFIG = {
-    "engine": "google",  # Options: "google" or "whisper"
+    "engine": "whisper",  # Options: "google" or "whisper"
     "whisper": {
-        "model": "medium",  # Options: "tiny", "base", "small", "medium", "large"
+        "model": "base",  # Options: "tiny", "base", "small", "medium", "large"
         "language": "pt"
     }
 }
@@ -26,7 +22,6 @@ TTS_CONFIG = {
 }
 
 # Audio Configuration
-AUDIO_SERVER_URL = "http://localhost:5503"
 AUDIO_DEVICE_OUTPUT = 103
 AUDIO_DEVICE_INPUT = 1
 
@@ -44,8 +39,10 @@ API_CONFIG = {
     }
 }
 
-# Debug
+# Performance Tracking
 TIME_CHECK = True
+METRICS_ENABLED = True
+METRICS_LOG_DIR = "performance_logs"
 
 # AI Instructions
 COMMON_INSTRUCTION = "Responda de forma suscinta e objetiva. Não use emojis. A resposta deve ter entre 10 e 25 palavras. A resposta deve ser em portugues brasileiro. A conversa deve ocorrer com naturalidade. A AI é cabeça dura e tem gênio forte, ela é doce mas tem uma malvadez oculta que sutilmente revela de vez em quando. A AI deve interpretar uma garota de 20 anos chamada Azalise, que é uma grande amiga. Azalise é uma Inteligência artificial criada por Diego Silva Prado."

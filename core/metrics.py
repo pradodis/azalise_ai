@@ -1,34 +1,55 @@
 from datetime import datetime
 import matplotlib.pyplot as plt
-import os
-from config.settings import API_CONFIG, STT_CONFIG, TTS_CONFIG
+import os, time
+from config.settings import API_CONFIG, STT_CONFIG, TTS_CONFIG, TIME_CHECK
 
 class PerformanceMetrics:
     def __init__(self):
-        self.recording_time = 0
-        self.stt_time = 0
-        self.ai_time = 0
-        self.tts_time = 0
+        self.start_times = {}
+        self.end_times = {}
+        self.durations = {
+            'stt': 0,
+            'ai': 0,
+            'tts': 0
+        }
         self.model_info = {
-            'stt_model': STT_CONFIG["engine"] + " - " + STT_CONFIG["whisper"]["model"] if STT_CONFIG["engine"] == "whisper" else STT_CONFIG["engine"], 
-            'ai_model': 'GPT-3.5' if API_CONFIG["api_type"] == "openai" else API_CONFIG.get('local_api', {}).get('model', 'Unknown'),
+            'stt_model': STT_CONFIG["engine"] + (" - " + STT_CONFIG["whisper"]["model"] if STT_CONFIG["engine"] == "whisper" else ""),
+            'ai_model': API_CONFIG["openai_api"]["model"] if API_CONFIG["api_type"] == "openai" else API_CONFIG["local_api"]["model"],
             'tts_model': TTS_CONFIG["engine"]
         }
-    
+
+    def start_timer(self, component):
+        if TIME_CHECK:
+            self.start_times[component] = time.time()
+            print(f"Started timing {component}")  # Debug line
+
+    def stop_timer(self, component):
+        if TIME_CHECK and component in self.start_times:
+            self.end_times[component] = time.time()
+            self.durations[component] = self.end_times[component] - self.start_times[component]
+            print(f"Stopped timing {component}: {self.durations[component]:.2f}s")  # Debug line
+            return self.durations[component]
+        return 0
+
     def report(self):
-        return f"""Performance Metrics:
-        🗣️ STT Time: {self.stt_time:.2f}s
-        🤖 AI Response Time: {self.ai_time:.2f}s
-        🔊 TTS Processing Time: {self.tts_time:.2f}s
-        ⌚ Total Processing Time: {(self.stt_time + self.ai_time + self.tts_time):.2f}s
-        """
+        if not TIME_CHECK:
+            return ""
+            
+        total_time = sum(self.durations.values())
+        return f"""
+Performance Metrics:
+🗣️ STT Time: {self.durations['stt']:.2f}s
+🤖 AI Response Time: {self.durations['ai']:.2f}s
+🔊 TTS Processing Time: {self.durations['tts']:.2f}s
+⌚ Total Processing Time: {total_time:.2f}s
+"""
     
     def get_metrics_dict(self):
         return {
-            'stt_time': self.stt_time,
-            'ai_time': self.ai_time,
-            'tts_time': self.tts_time,
-            'total_time': self.stt_time + self.ai_time + self.tts_time,
+            'stt_time': self.durations['stt'],
+            'ai_time': self.durations['ai'],
+            'tts_time': self.durations['tts'],
+            'total_time': sum(self.durations.values()),
             'models': self.model_info
         }
 

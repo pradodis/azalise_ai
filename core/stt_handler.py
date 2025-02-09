@@ -96,26 +96,73 @@ def transcribe_audio():
         print(f"{time.strftime('%H:%M:%S')} [STT] Erro: {str(e)}")
         return jsonify({"success": False, "error": str(e)}), 400
 
+@app.route('/stop_recording', methods=['POST'])
+def stop_recording():
+    """Handle recording stop and transcription"""
+    try:
+        session_id = request.headers.get('X-Session-ID')
+        if not session_id:
+            return jsonify({"success": False, "error": "No session ID provided"}), 400
+            
+        if session_id in active_sessions:
+            active_sessions[session_id]['last_activity'] = time.time()
+            
+            # Get audio data from request
+            audio_data = request.get_data()
+            if not audio_data:
+                return jsonify({"success": False, "error": "No audio data received"}), 400
+            
+            wav_buffer = io.BytesIO(audio_data)
+            
+            if STT_CONFIG["engine"] == "whisper":
+                # For Whisper, we need to save the audio temporarily
+                import tempfile
+                import os
+                
+                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
+                temp_file.write(audio_data)
+                temp_file.close()
+                
+                try:
+                    text = transcribe_with_whisper(temp_file.name)
+                finally:
+                    os.unlink(temp_file.name)
+            else:
+                with sr.AudioFile(wav_buffer) as source:
+                    audio = recognizer.record(source)
+                text = transcribe_with_google(audio)
+            
+            print(f"{time.strftime('%H:%M:%S')} [STT] Texto transcrito: {text}")
+            return jsonify({
+                "success": True, 
+                "text": text,
+                "model": STT_CONFIG["whisper"]["model"] if STT_CONFIG["engine"] == "whisper" else "google"
+            })
+        else:
+            print(f"{time.strftime('%H:%M:%S')} [STT] Sessão inválida: {session_id}")
+            return jsonify({"success": False, "error": "Invalid session"}), 403
+            
+    except Exception as e:
+        print(f"{time.strftime('%H:%M:%S')} [STT] Erro: {str(e)}")
+        return jsonify({"success": False, "error": str(e)}), 400
+
 @app.route('/', methods=['GET'])
-def health_check():
-    global client_connected
-    session_id = request.args.get('session_id')
+def root():
+    """Root endpoint for health checks"""
+    session_id = request.args.get('session_id') or request.headers.get('X-Session-ID')
     
-    if not session_id:
-        return {"status": "error", "message": "No session ID provided"}, 400
-        
-    if session_id not in active_sessions:
+    if session_id and session_id not in active_sessions:
         active_sessions[session_id] = {
             'connected_at': time.time(),
             'last_activity': time.time()
         }
         print(f"{time.strftime('%H:%M:%S')} [STT] Novo cliente conectado (Session: {session_id})")
-        print(f"{time.strftime('%H:%M:%S')} [STT] Sessões ativas: {list(active_sessions.keys())}")
-        client_connected = True
-    else:
-        active_sessions[session_id]['last_activity'] = time.time()
-        
-    return {"status": "healthy", "service": "STT Server", "message": "Connection established"}, 200
+    
+    return {
+        "status": "healthy",
+        "service": "STT Server",
+        "message": "Connection established"
+    }, 200
 
 def cleanup_session(session_id):
     if session_id in active_sessions:
