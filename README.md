@@ -40,6 +40,18 @@ cd azalise-ai
     - For ElevenLabs, add your key file in elevenlabs_api.txt (or adjust the path in config/settings.py).
     - Also configure your OpenAI API key in openai_api.txt or adjust in settings.py.
 
+## Configuration
+
+1. Copy `.env.example` to `.env`
+2. Configure your API keys and settings in `.env`:
+```bash
+ELEVENLABS_API_KEY=your_key_here
+OPENAI_API_KEY=your_key_here
+...
+```
+3. Run `python core/audio_test.py` to find your audio device IDs
+4. Update AUDIO_DEVICE_INPUT and AUDIO_DEVICE_OUTPUT in `.env`
+
 ## Quick Start
 There are different ways to run the assistant:
 

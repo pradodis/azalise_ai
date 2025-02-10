@@ -172,3 +172,13 @@ cython_debug/
 
 # Folders
 performance_charts/
+
+# Sensitive files
+.env
+*.txt
+!requirements.txt
+!.env.example
+
+# API Keys and Credentials
+*_api.txt
+*.json

@@ -1,10 +1,15 @@
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
 # STT Configuration
 STT_SERVER_URL = "http://localhost:5502"  # Removido /transcribe para usar na verificação de conexão
 STT_TRANSCRIBE_URL = "http://localhost:5502/transcribe"  # Nova URL específica para transcrição
 STT_CONFIG = {
     "engine": "whisper",  # Options: "google" or "whisper"
     "whisper": {
-        "model": "base",  # Options: "tiny", "base", "small", "medium", "large"
+        "model": "small",  # Options: "tiny", "base", "small", "medium", "large"
         "language": "pt"
     }
 }
@@ -13,11 +18,11 @@ STT_CONFIG = {
 TTS_SERVER_URL = "http://localhost:5501"  # Removido /synthesize para usar na verificação de conexão
 TTS_SYNTHESIS_URL = "http://localhost:5501/synthesize"  # Nova URL específica para síntese
 TTS_CONFIG = {
-    "engine": "coqui",  # Options: "coqui" or "elevenlabs"
+    "engine": "elevenlabs",
     "elevenlabs": {
-        "api_key": open("D:/Azalise_AI/elevenlabs_api.txt").read().strip(),
-        "voice_id": "21m00Tcm4TlvDq8ikWAM",  # default voice ID
-        "model_id": "eleven_multilingual_v2"
+        "api_key": os.getenv("ELEVENLABS_API_KEY"),
+        "voice_id": os.getenv("ELEVENLABS_VOICE_ID"),
+        "model_id": os.getenv("ELEVENLABS_MODEL_ID")
     }
 }
 
@@ -27,15 +32,15 @@ AUDIO_DEVICE_INPUT = 1
 
 # API Configuration
 API_CONFIG = {
-    "api_type": "openai",  # "local" ou "openai"
+    "api_type": os.getenv("API_TYPE", "openai"),
     "local_api": {
-        "url": "http://127.0.0.1:5000/v1/chat/completions",
+        "url": "http://localhost:5000/v1/chat/completions",
         "model": "Meta8BQ4"
     },
     "openai_api": {
-        "url": "https://api.openai.com/v1/chat/completions", 
-        "api_key": open("D:/Azalise_AI/openai_api.txt").read().strip(),
-        "model": "gpt-4o-mini"
+        "url": "https://api.openai.com/v1/chat/completions",
+        "api_key": os.getenv("OPENAI_API_KEY"),
+        "model": os.getenv("OPENAI_MODEL")
     }
 }
 
