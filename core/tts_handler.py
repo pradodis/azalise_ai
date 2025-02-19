@@ -1,27 +1,63 @@
-import sys, os, logging, threading, queue, tempfile, time
-import torch, numpy as np, soundfile as sf, librosa, sounddevice as sd
-import requests
-from flask import Flask, request, Response, stream_with_context
+import sys, os, logging, tempfile, time
+import torch
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from contextlib import asynccontextmanager
 from TTS.api import TTS
 from pathlib import Path
-from TTS.utils.manage import ModelManager
 import pygame
+import asyncio
+import aiohttp
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, Optional
+import aiofiles
 
 # Import settings
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from config.settings import AUDIO_DEVICE_OUTPUT, TTS_CONFIG, TIME_CHECK
 from core.metrics import PerformanceMetrics
 
-app = Flask(__name__)
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("tts_handler")
 
-# Add connection tracking
-client_connected = False
+# Define lifespan before creating FastAPI app
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for FastAPI application"""
+    global tts_handler
+    try:
+        logger.info("Initializing TTS handler...")
+        tts_handler = await TTSHandler.create()
+        yield
+    finally:
+        if tts_handler:
+            logger.info("Cleaning up TTS handler...")
+            await tts_handler.cleanup()
 
-# Add global metrics instance
+# Initialize FastAPI with lifespan
+app = FastAPI(lifespan=lifespan)
+
+# Global state
+active_sessions: Dict[str, dict] = {}
+thread_pool = ThreadPoolExecutor(max_workers=4)
 metrics = PerformanceMetrics()
+tts_handler = None
 
-class AudioPlayer:
+class AsyncAudioPlayer:
     def __init__(self):
+        self.initialized = False
+        self.lock = asyncio.Lock()
+        self.queue = asyncio.Queue()
+        self.player_task = None
+        
+    async def initialize(self):
+        if not self.initialized:
+            await asyncio.get_event_loop().run_in_executor(None, self._init_pygame)
+            self.player_task = asyncio.create_task(self._process_queue())
+            self.initialized = True
+            
+    def _init_pygame(self):
         pygame.init()
         pygame.mixer.init(
             frequency=48000,
@@ -29,152 +65,191 @@ class AudioPlayer:
             channels=2,
             buffer=256
         )
-        self.is_playing = False
-        self.lock = threading.Lock()
-        self.current_file = None
-        self.cleanup_thread = None
-
-    def play_audio(self, file_path, delete_after=True):
-        try:
-            print(f"[AudioPlayer] Iniciando reprodução do arquivo: {file_path}")
-            with self.lock:
-                # Stop any currently playing audio
-                if pygame.mixer.music.get_busy():
-                    print("[AudioPlayer] Parando áudio anterior")
-                    pygame.mixer.music.stop()
-                    pygame.mixer.music.unload()
-                
-                # Check if file exists and has content
-                if not os.path.exists(file_path):
-                    print(f"[AudioPlayer] Erro: Arquivo não existe: {file_path}")
-                    return False
-                    
-                file_size = os.path.getsize(file_path)
-                if file_size == 0:
-                    print("[AudioPlayer] Erro: Arquivo de áudio vazio")
-                    return False
-                    
-                print(f"[AudioPlayer] Carregando arquivo ({file_size} bytes)")
-                pygame.mixer.music.load(file_path)
-                print("[AudioPlayer] Iniciando playback")
-                pygame.mixer.music.play()
-                
-                # Start cleanup thread
-                if self.cleanup_thread and self.cleanup_thread.is_alive():
-                    self.cleanup_thread.join()
-                self.cleanup_thread = threading.Thread(
-                    target=self._wait_and_cleanup, 
-                    args=(file_path, delete_after)
-                )
-                self.cleanup_thread.daemon = True
-                self.cleanup_thread.start()
-                
-        except Exception as e:
-            print(f"[AudioPlayer] Erro ao reproduzir áudio: {str(e)}")
-            return False
+            
+    async def play_audio(self, file_path: str, delete_after: bool = True):
+        """Add audio file to queue instead of playing directly"""
+        if not self.initialized:
+            await self.initialize()
+        
+        # Add to queue and return immediately
+        await self.queue.put((file_path, delete_after))
         return True
+            
+    async def _process_queue(self):
+        """Background task to process audio queue"""
+        while True:
+            try:
+                # Wait for next item in queue
+                file_path, delete_after = await self.queue.get()
+                
+                try:
+                    async with self.lock:
+                        # Play current audio
+                        await asyncio.get_event_loop().run_in_executor(
+                            None,
+                            self._play_and_wait,
+                            file_path
+                        )
+                        
+                        if delete_after:
+                            try:
+                                os.unlink(file_path)
+                            except Exception as e:
+                                logger.warning(f"Failed to delete file: {e}")
+                                
+                except Exception as e:
+                    logger.error(f"Error playing audio: {e}")
+                finally:
+                    # Mark task as done even if there was an error
+                    self.queue.task_done()
+                    
+            except Exception as e:
+                logger.error(f"Queue processor error: {e}")
+                await asyncio.sleep(1)  # Prevent tight loop on error
 
-    def _wait_and_cleanup(self, file_path, delete_after):
+    def _play_and_wait(self, file_path: str):
         try:
+            if pygame.mixer.music.get_busy():
+                pygame.mixer.music.stop()
+                pygame.mixer.music.unload()
+                
+            pygame.mixer.music.load(file_path)
+            pygame.mixer.music.play()
+            
             # Wait for playback to complete
             while pygame.mixer.music.get_busy():
                 time.sleep(0.1)
-            
-            # Cleanup after playback
+                
             pygame.mixer.music.unload()
-            if delete_after and os.path.exists(file_path):
-                try:
-                    os.unlink(file_path)
-                except Exception as e:
-                    print(f"Aviso: Falha ao deletar arquivo: {e}")
+            
         except Exception as e:
-            print(f"Erro no cleanup do áudio: {e}")
+            logger.error(f"Pygame playback error: {e}")
+            raise
 
-    def __del__(self):
-        # Cleanup on object destruction
-        if self.current_file and os.path.exists(self.current_file):
+    async def cleanup(self):
+        """Cleanup player resources"""
+        if self.player_task:
+            self.player_task.cancel()
             try:
-                pygame.mixer.music.unload()
-                os.unlink(self.current_file)
-            except Exception:
+                await self.player_task
+            except asyncio.CancelledError:
                 pass
+        # Wait for remaining items
+        if hasattr(self, 'queue'):
+            await self.queue.join()
+        
+        if hasattr(self, 'lock'):
+            async with self.lock:
+                if pygame.mixer.get_init():
+                    pygame.mixer.quit()
 
-class TextToSpeechHandler:
-    def __init__(self, audio_device_output=None):
-        logging.basicConfig(level=logging.INFO)
-        self.logger = logging.getLogger(__name__)
+class TTSHandler:
+    def __init__(self):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.engine = TTS_CONFIG.get("engine", "coqui")
-        self.audio_player = AudioPlayer()
+        self.audio_player = AsyncAudioPlayer()
+        self.model_ready = asyncio.Event()
+        self.elevenlabs_config = TTS_CONFIG.get("elevenlabs", {})
+        self.tts = None
         
+    @classmethod
+    async def create(cls):
+        """Factory method to create and initialize TTSHandler"""
+        instance = cls()
+        await instance.initialize_model()
+        return instance
+
+    async def initialize_model(self):
         if self.engine == "coqui":
             try:
-                # Pré-carregar modelo em thread separada
-                def load_model():
-                    manager = ModelManager()
-                    pt_models = [m for m in manager.list_models() if "/pt/" in m]
-                    model_name = next((m for m in pt_models if "tacotron2-DDC" in m.lower()), pt_models[0])
-                    self.tts = TTS(model_name).to(self.device)
-                    self.model_ready = True
-                    self.logger.info(f"Model loaded successfully on {self.device}")
-                    
-                threading.Thread(target=load_model).start()
-                
+                # Load model in thread pool
+                await asyncio.get_event_loop().run_in_executor(
+                    thread_pool,
+                    self._load_coqui_model
+                )
+                self.model_ready.set()
             except Exception as e:
-                self.logger.error(f"Failed to load TTS model: {e}")
-                raise e
-        
-        self.elevenlabs_config = TTS_CONFIG.get("elevenlabs", {})
+                logger.error(f"Failed to load TTS model: {e}")
+                raise
 
-    def _get_device_sample_rate(self):
-        return 48000  # Fixed sample rate for consistency
+    def _load_coqui_model(self):
+        """Initialize Coqui TTS model"""
+        try:
+            logger.info("Loading Coqui TTS model...")
+            if "coqui" not in TTS_CONFIG:
+                raise ValueError("Missing 'coqui' configuration in TTS_CONFIG")
+            if "model_name" not in TTS_CONFIG["coqui"]:
+                raise ValueError("Missing 'model_name' in TTS_CONFIG['coqui']")
+                
+            model_name = TTS_CONFIG["coqui"]["model_name"]
+            logger.info(f"Using Coqui model: {model_name}")
+            
+            self.tts = TTS(
+                model_name=model_name,
+                progress_bar=False,
+                gpu=torch.cuda.is_available()
+            )
+            logger.info("Coqui TTS model loaded successfully")
+        except KeyError as e:
+            logger.error(f"Configuration error: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Failed to load Coqui model: {e}")
+            raise
 
-    def synthesize(self, text):
-        """Generate audio file, play it and return success status"""
+    async def synthesize(self, text: str) -> dict:
+        """Main synthesis method that routes to appropriate engine"""
         if TIME_CHECK:
             metrics.start_timer('tts')
             
-        result = self.synthesize_elevenlabs(text) if self.engine == "elevenlabs" else self.synthesize_coqui(text)
-        
-        if TIME_CHECK and result.get("success"):
-            metrics.stop_timer('tts')
-            # Removido print das métricas daqui, será feito apenas no run.py
-            
-        return result
-
-    def synthesize_coqui(self, text):
         try:
+            if self.engine == "elevenlabs":
+                result = await self.synthesize_elevenlabs(text)
+            else:
+                # Wait for model to be ready
+                await self.model_ready.wait()
+                result = await self.synthesize_coqui(text)
+                
+            if TIME_CHECK and result.get("success"):
+                metrics.stop_timer('tts')
+                
+            return result
+        except Exception as e:
+            logger.error(f"Synthesis failed: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def synthesize_coqui(self, text: str) -> dict:
+        try:
+            # Create temp file
             temp_dir = os.path.join(tempfile.gettempdir(), 'tts_cache')
             os.makedirs(temp_dir, exist_ok=True)
-            
-            # Use a unique filename based on timestamp and text hash
             temp_file = os.path.join(temp_dir, f"{int(time.time())}_{hash(text)}.wav")
             
-            # Ensure file doesn't exist
-            if os.path.exists(temp_file):
-                try:
-                    os.unlink(temp_file)
-                except:
-                    temp_file = os.path.join(temp_dir, f"{int(time.time())}_{hash(text)}_{os.urandom(4).hex()}.wav")
-            
-            # Sintetizar diretamente para o arquivo
-            self.tts.tts_to_file(
-                text=text,
-                file_path=temp_file,
-                gpu=torch.cuda.is_available()
+            # Run synthesis in thread pool
+            await asyncio.get_event_loop().run_in_executor(
+                thread_pool,
+                self._run_coqui_synthesis,
+                text,
+                temp_file
             )
             
-            # Play audio directly
-            self.audio_player.play_audio(temp_file, delete_after=True)
+            # Play audio asynchronously
+            await self.audio_player.play_audio(temp_file)
             return {"success": True}
             
         except Exception as e:
-            self.logger.error(f"Synthesis failed: {e}")
+            logger.error(f"Coqui synthesis failed: {e}")
             return {"success": False, "error": str(e)}
+            
+    def _run_coqui_synthesis(self, text: str, file_path: str):
+        self.tts.tts_to_file(
+            text=text,
+            file_path=file_path,
+            gpu=torch.cuda.is_available()
+        )
 
-    def synthesize_elevenlabs(self, text):
+    async def synthesize_elevenlabs(self, text: str) -> dict:
         try:
-            print("[TTS] Iniciando síntese ElevenLabs")
             url = f"https://api.elevenlabs.io/v1/text-to-speech/{self.elevenlabs_config['voice_id']}"
             headers = {
                 "xi-api-key": self.elevenlabs_config["api_key"],
@@ -190,98 +265,84 @@ class TextToSpeechHandler:
                 }
             }
 
-            print("[TTS] Enviando requisição para ElevenLabs API")
-            response = requests.post(url, json=data, headers=headers)
-            print(f"[TTS] Status da resposta: {response.status_code}")
-            
-            if response.status_code == 200:
-                print(f"[TTS] Content-Type recebido: {response.headers.get('Content-Type')}")
-                content_length = len(response.content)
-                print(f"[TTS] Tamanho do áudio recebido: {content_length} bytes")
-                
-                if content_length == 0:
-                    print("[TTS] Erro: Resposta vazia da API")
-                    return {"success": False, "error": "Empty response from API"}
-                
-                # Save as MP3 and play directly
-                temp_file = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False, prefix="tts_").name
-                print(f"[TTS] Salvando áudio em: {temp_file}")
-                
-                with open(temp_file, "wb") as f:
-                    f.write(response.content)
-                
-                print("[TTS] Iniciando reprodução")
-                if self.audio_player.play_audio(temp_file, delete_after=True):
-                    print("[TTS] Reprodução iniciada com sucesso")
-                    return {"success": True}
-                else:
-                    print("[TTS] Falha ao iniciar reprodução")
-                    return {"success": False, "error": "Failed to play audio"}
-            else:
-                error_msg = f"ElevenLabs API error: {response.status_code}"
-                print(f"[TTS] {error_msg}")
-                try:
-                    error_detail = response.json()
-                    print(f"[TTS] Detalhes do erro: {error_detail}")
-                except:
-                    pass
-                return {"success": False, "error": error_msg}
+            async with aiofiles.tempfile.NamedTemporaryFile(
+                suffix=".mp3", delete=False, prefix="tts_"
+            ) as temp_file:
+                # Make API request with aiohttp
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, json=data, headers=headers) as response:
+                        if response.status == 200:
+                            audio_data = await response.read()
+                            await temp_file.write(audio_data)
+                            temp_path = temp_file.name
+
+                # Play audio asynchronously
+                await self.audio_player.play_audio(temp_path)
+                return {"success": True}
         except Exception as e:
-            error_msg = f"ElevenLabs synthesis failed: {str(e)}"
-            print(f"[TTS] {error_msg}")
-            return {"success": False, "error": error_msg}
+            logger.error(f"ElevenLabs synthesis failed: {e}")
+            return {"success": False, "error": str(e)}
 
-@app.route('/synthesize', methods=['POST'])
-def synthesize_speech():
+    async def cleanup(self):
+        """Cleanup resources"""
+        if hasattr(self, 'audio_player'):
+            await self.audio_player.cleanup()
+        if hasattr(self, 'tts'):
+            self.tts = None
+
+@app.post("/synthesize")
+async def synthesize_speech(request: Request):
     try:
-        data = request.get_json(force=True)  # Mais rápido que request.json
-        text = data.get('text')
-        if not text: 
-            return {"success": False, "error": "No text provided"}, 400
-        
-        result = tts_handler.synthesize(text)
-        return result, 200 if result["success"] else 500
-        
-    except Exception as e:
-        return {"success": False, "error": f"Server error: {str(e)}"}, 500
+        if not tts_handler:
+            return JSONResponse(
+                status_code=503,
+                content={"success": False, "error": "TTS handler not initialized"}
+            )
 
-@app.route('/', methods=['GET'])
-def root():
-    """Root endpoint for health checks"""
-    session_id = request.args.get('session_id') or request.headers.get('X-Session-ID')
+        data = await request.json()
+        text = data.get('text')
+        if not text:
+            return JSONResponse(
+                status_code=400,
+                content={"success": False, "error": "No text provided"}
+            )
+            
+        session_id = request.headers.get('X-Session-ID')
+        if session_id:
+            active_sessions[session_id]['last_activity'] = time.time()
+            
+        result = await tts_handler.synthesize(text)
+        return JSONResponse(
+            content=result,
+            status_code=200 if result["success"] else 500
+        )
+    except Exception as e:
+        logger.error(f"Error in synthesis endpoint: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": str(e)}
+        )
+
+@app.get("/")
+async def root(request: Request):
+    """Health check endpoint"""
+    session_id = request.query_params.get('session_id') or request.headers.get('X-Session-ID')
     
-    if session_id:
-        # Add session tracking if needed
-        pass
-        
+    if session_id and session_id not in active_sessions:
+        active_sessions[session_id] = {
+            'connected_at': time.time(),
+            'last_activity': time.time()
+        }
+        logger.info(f"New client connected (Session: {session_id})")
+    
     return {
         "status": "healthy",
         "service": "TTS Server",
         "message": "Connection established"
-    }, 200
-
-@app.errorhandler(500)
-def handle_error(e):
-    global client_connected
-    if (client_connected):
-        print(f"{time.strftime('%H:%M:%S')} [TTS] Cliente desconectado")
-        client_connected = False
-    return {"error": str(e)}, 500
-
-tts_handler = TextToSpeechHandler(audio_device_output=AUDIO_DEVICE_OUTPUT)
+    }
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-    logging.getLogger('werkzeug').setLevel(logging.ERROR)
-    sys.modules['flask.cli'].show_server_banner = lambda *x: None
-    print("\n[TTS] Servidor TTS iniciado com sucesso em http://localhost:5501")
-    print("[TTS] Aguardando conexões...")
-    app.config['PROPAGATE_EXCEPTIONS'] = True
-    app.run(
-        host='localhost', 
-        port=5501, 
-        debug=False, 
-        use_reloader=False,
-        threaded=True,
-        processes=1
-    )
+    import uvicorn
+    logger.info("\n[TTS] TTS Server started successfully at http://localhost:5501")
+    logger.info("[TTS] Waiting for connections...")
+    uvicorn.run(app, host='localhost', port=5501, workers=1)

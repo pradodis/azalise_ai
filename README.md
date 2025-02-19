@@ -16,25 +16,36 @@ A voice assistant in Python that combines speech recognition, text-to-speech con
 
 ## Requirements
 
-- Python 3.8 or higher
+- Python 3.10.11 (required version)
+- CUDA 12.1 with compatible NVIDIA GPU
 - Packages listed in requirements.txt, including (main ones):
-- PyAudio
-- TTS (Text-to-Speech)
-- SpeechRecognition
-- PyNput
-- Flask
-- Torch
-- Whisper
-- Colorama
-- Pygame
-- aiohttp
-- matplotlib
+  - PyTorch (with CUDA 12.1 support)
+  - PyAudio
+  - TTS (Text-to-Speech)
+  - SpeechRecognition
+  - PyNput
+  - Flask
+  - Whisper
+  - Colorama
+  - Pygame
+  - aiohttp
+  - matplotlib
 
 ## Installation
 
-1. Clone the repository: git clone https://github.com/yourusername/azalise-ai.git
+1. Make sure you have Python 3.10.11 installed
+2. Install CUDA 12.1 if you haven't already
+3. Clone the repository:
+```bash
+git clone https://github.com/yourusername/azalise-ai.git
 cd azalise-ai
-2. Install dependencies (using venv or your preferred package manager): pip install -r requirements.txt
+```
+4. Set up a virtual environment and install dependencies:
+```bash
+python -m venv venv
+source venv/Scripts/activate  # On Windows use: venv\Scripts\activate
+pip install -r requirements.txt
+```
 3. (Optional) Configure credentials if using Google Cloud Speech-to-Text or ElevenLabs:
     - Set the environment variable GOOGLE_APPLICATION_CREDENTIALS to your Google Cloud JSON path.
     - For ElevenLabs, add your key file in elevenlabs_api.txt (or adjust the path in config/settings.py).

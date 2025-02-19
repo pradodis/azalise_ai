@@ -11,7 +11,7 @@ from TTS.api import TTS
 from config.settings import (API_CONFIG, AUDIO_DEVICE_INPUT, AUDIO_DEVICE_OUTPUT, 
                            TTS_SERVER_URL, STT_SERVER_URL, TTS_SYNTHESIS_URL, 
                            STT_TRANSCRIBE_URL, COMMON_INSTRUCTION, TIME_CHECK,
-                            STT_CONFIG,TTS_CONFIG)
+                            STT_CONFIG,TTS_CONFIG, MEMORY_CONFIG)
 from time import perf_counter
 import matplotlib.pyplot as plt
 import os
@@ -19,8 +19,29 @@ from datetime import datetime
 from core.async_server_connection import AsyncServerConnection
 import asyncio
 import aiohttp
+from core.memory_manager import MemoryManager
 
 history = []
+
+def cronometrar(func):
+    def wrapper(*args, **kwargs):
+        start_time = perf_counter()
+        result = func(*args, **kwargs)
+        end_time = perf_counter()
+        elapsed_time = end_time - start_time
+        print(f"Tempo transcorrido para {func.__name__}: {elapsed_time:.4f} segundos")
+        return result
+    return wrapper
+
+def async_cronometrar(func):
+    async def wrapper(*args, **kwargs):
+        start_time = perf_counter()
+        result = await func(*args, **kwargs)
+        end_time = perf_counter()
+        elapsed_time = end_time - start_time
+        print(f"Tempo transcorrido para {func.__name__}: {elapsed_time:.4f} segundos")
+        return result
+    return wrapper
 
 class PerformanceMetrics:
     def __init__(self):
@@ -106,7 +127,7 @@ class ServerConnection:
         except Exception as e:
             print(f"Erro ao desconectar do servidor {self.name}: {str(e)}")
 
-class VoiceRecorder:
+class MainLoop:
     def __init__(self):
         init()
         self.is_recording = False
@@ -118,6 +139,10 @@ class VoiceRecorder:
         self.FORMAT = pyaudio.paInt16
         self.CHANNELS = 1
         self.RATE = 44100
+        
+        # Create new event loop for this instance
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
         
         self.output_device_index = AUDIO_DEVICE_OUTPUT
         self.api_config = API_CONFIG
@@ -131,6 +156,8 @@ class VoiceRecorder:
         asyncio.run(self.initialize_connections())
         
         self.metrics = PerformanceMetrics()
+        self.memory_manager = MemoryManager()
+        print(f"{Fore.GREEN}Sistema inicializado com modo de memória: {MEMORY_CONFIG['method']}{Style.RESET_ALL}")
 
         print(f"{Fore.GREEN}Sistema inicializado com sucesso!{Style.RESET_ALL}")
         print("Pressione e segure '0' para gravar, solte para converter para texto.")
@@ -148,6 +175,10 @@ class VoiceRecorder:
             self.stt_server.wait_for_connection()
         )
 
+    def run_async(self, coro):
+        """Helper method to run coroutines in the instance's event loop"""
+        return self.loop.run_until_complete(coro)
+
     async def monitor_connections(self):
         """Async connection monitoring"""
         while True:
@@ -164,19 +195,11 @@ class VoiceRecorder:
             print(f"Conexão perdida com servidor {server.name}. Tentando reconectar...")
             await server.wait_for_connection()
 
-    def list_audio_devices(self):
-        print("\nAvailable Audio Input Devices:")
-        for i in range(self.p.get_device_count()):
-            dev_info = self.p.get_device_info_by_index(i)
-            if dev_info['maxInputChannels'] > 0:  # Show input devices
-                print(f"Device {i}: {dev_info['name']}")
-                
-        print("\nAvailable Audio Output Devices:")
-        for i in range(self.p.get_device_count()):
-            dev_info = self.p.get_device_info_by_index(i)
-            if dev_info['maxOutputChannels'] > 0:  # Show output devices
-                print(f"Device {i}: {dev_info['name']}")
-
+    async def quick_answer_loop(self):
+        recorded_sound = await self.stop_recording()
+        transcription = await self.send_audio_to_STT(recorded_sound)
+        await self.process_ai_response(transcription)
+        
     def start_recording(self):
         print(f"{Fore.CYAN}Iniciando gravação...{Style.RESET_ALL}")
         if TIME_CHECK:
@@ -204,10 +227,10 @@ class VoiceRecorder:
         
         if not self.audio_data:
             print("Nenhum áudio gravado")
-            return
+            return None
 
         try:
-            # Create WAV data in memory
+            # Create WAV data in memory with buffer size 256
             wav_buffer = io.BytesIO()
             with wave.open(wav_buffer, 'wb') as wav_file:
                 wav_file.setnchannels(self.CHANNELS)
@@ -215,159 +238,91 @@ class VoiceRecorder:
                 wav_file.setframerate(self.RATE)
                 wav_file.writeframes(b''.join(self.audio_data))
             
-            # STT timing
-            if TIME_CHECK:
-                stt_start = perf_counter()
-
-            # Send audio data to STT server
-            async with aiohttp.ClientSession() as session:
-                headers = {
-                    'Content-Type': 'audio/wav',
-                    'X-Session-ID': self.stt_server.session_id
-                }
-                
-                async with session.post(
-                    f"{STT_SERVER_URL}/stop_recording",
-                    data=wav_buffer.getvalue(),
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=30)
-                ) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        if result.get("success"):
-                            transcription = result.get("text", "").strip()
-                            print(f"{Fore.LIGHTBLUE_EX}Você disse: {transcription}{Style.RESET_ALL}")
-                            
-                            if TIME_CHECK:
-                                ai_start = perf_counter()
-                                self.metrics.stt_time = ai_start - stt_start
-                                
-                            # Update Whisper model information if available
-                            if "model" in result:
-                                self.metrics.model_info['stt_model'] = f"Whisper {result['model']}"
-                                
-                            # Process transcription with AI
-                            if transcription:
-                                await self.process_ai_turn(transcription)
-                        else:
-                            print(f"{Fore.RED}Falha na transcrição: {result.get('error')}{Style.RESET_ALL}")
-                    else:
-                        print(f"{Fore.RED}Erro na requisição STT: {response.status}{Style.RESET_ALL}")
-                        
+            return wav_buffer
         except Exception as e:
             print(f"{Fore.RED}Erro ao processar áudio: {str(e)}{Style.RESET_ALL}")
+            return None
+
+    async def send_audio_to_STT(self, wav_buffer) -> None:
+        """Send audio data to STT server with retry logic"""
+        if not wav_buffer:
+            return
+
+        if TIME_CHECK:
+            stt_start = perf_counter()
+
+        max_retries = 3
+        retry_delay = 1
+
+        try:
+            if not hasattr(self, '_session'):
+                self._session = aiohttp.ClientSession()
+
+            headers = {
+                'Content-Type': 'audio/wav',
+                'X-Session-ID': self.stt_server.session_id,
+                'Accept-Encoding': 'gzip, deflate'
+            }
+            
+            wav_buffer.seek(0)
+            
+            for attempt in range(max_retries):
+                try:
+                    async with self._session.post(
+                        f"{STT_SERVER_URL}/transcribe",
+                        data=wav_buffer.getvalue(),
+                        headers=headers,
+                        timeout=aiohttp.ClientTimeout(total=30)
+                    ) as response:
+                        if response.status == 200:
+                            result = await response.json()
+                            if result.get("success"):
+                                transcription = result.get("text", "").strip()
+                                print(f"{Fore.LIGHTBLUE_EX}Você disse: {transcription}{Style.RESET_ALL}")
+                                
+                                if TIME_CHECK:
+                                    self.metrics.stt_time = perf_counter() - stt_start
+                                    
+                                if "model" in result:
+                                    self.metrics.model_info['stt_model'] = f"Whisper {result['model']}"
+                                    
+                                return transcription if transcription else None
+                            
+                            print(f"{Fore.RED}Falha na transcrição: {result.get('error')}{Style.RESET_ALL}")
+                            return None
+
+                        # Se receber 429 (Too Many Requests) ou 5xx, tenta novamente
+                        if response.status in {429} or 500 <= response.status < 600:
+                            if attempt < max_retries - 1:
+                                wait_time = retry_delay * (attempt + 1)
+                                print(f"{Fore.YELLOW}Tentativa {attempt + 1} falhou, aguardando {wait_time}s...{Style.RESET_ALL}")
+                                await asyncio.sleep(wait_time)
+                                continue
+                            
+                        error_text = await response.text()
+                        print(f"{Fore.RED}Erro na requisição STT: {response.status}")
+                        print(f"Detalhes do erro: {error_text}{Style.RESET_ALL}")
+                        return None
+
+                except asyncio.TimeoutError:
+                    if attempt < max_retries - 1:
+                        wait_time = retry_delay * (attempt + 1)
+                        print(f"{Fore.YELLOW}Timeout na tentativa {attempt + 1}, aguardando {wait_time}s...{Style.RESET_ALL}")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    raise
+
+        except Exception as e:
+            print(f"{Fore.RED}Erro ao processar áudio: {str(e)}{Style.RESET_ALL}")
+            return None
+        finally:
+            if wav_buffer:
+                wav_buffer.close()
 
     def _record(self):
         while self.is_recording:
             data = self.stream.read(self.CHUNK)
             self.audio_data.append(data)
-
-    def _convert_to_text(self):
-        if not self.audio_data:
-            print("Nenhum áudio gravado")
-            return
-
-        if not self.stt_server.is_connected:
-            print("Servidor STT não está disponível")
-            return
-
-        # STT timing
-        if TIME_CHECK:
-            stt_start = perf_counter()
-
-        # Create WAV data in memory
-        wav_buffer = io.BytesIO()
-        with wave.open(wav_buffer, 'wb') as wav_file:
-            wav_file.setnchannels(self.CHANNELS)
-            wav_file.setsampwidth(self.p.get_sample_size(self.FORMAT))
-            wav_file.setframerate(self.RATE)
-            wav_file.writeframes(b''.join(self.audio_data))
-
-        # Send audio data to STT server with session ID
-        try:
-            headers = {
-                'Content-Type': 'audio/wav',
-                'X-Session-ID': self.stt_server.session_id  # Garantir que o session_id está sendo enviado
-            }
-            
-            response = requests.post(
-                STT_TRANSCRIBE_URL,
-                data=wav_buffer.getvalue(),
-                headers=headers
-            )
-            
-            if response.status_code == 200:
-                if TIME_CHECK:
-                    ai_start = perf_counter()
-                result = response.json()
-                if result['success']:
-                    texto = result['text']
-                    # Update Whisper model information if available in response
-                    if 'model' in result:
-                        self.metrics.model_info['stt_model'] = f"Whisper {result['model']}"
-                    print(f"{Fore.LIGHTBLUE_EX}Você disse: {texto}{Style.RESET_ALL}")
-                    
-                    # Enviar texto para a API do oobabooga
-                    try:
-                        headers = {
-                            "Content-Type": "application/json"
-                        }
-
-                        history.append({"role": "user", "content": texto + COMMON_INSTRUCTION})
-                        
-                        if self.api_config["api_type"] == "local":
-                            data = {
-                                "messages": history,
-                                "mode": "instruct",
-                                "model": self.api_config["local_api"]["model"],
-                            }
-                        else:
-                            headers["Authorization"] = f"Bearer {self.api_config['openai_api']['api_key']}"
-                            data = {
-                                "messages": history,
-                                "model": self.api_config["openai_api"]["model"],
-                                "temperature": 0.7
-                            }
-                                    
-                        response = requests.post(self.api_url, headers=headers, json=data)
-                        
-                        if response.status_code == 200:
-                            if TIME_CHECK:
-                                self.metrics.ai_time = perf_counter() - ai_start
-                                self.metrics.stt_time = ai_start - stt_start
-                            api_response = response.json()
-                            
-                            # Update AI model information for OpenAI
-                            if self.api_config["api_type"] == "openai" and "model" in api_response:
-                                self.metrics.model_info['ai_model'] = api_response["model"]
-                            
-                            assistant_message = api_response['choices'][0]['message']['content']
-                            print(f"{Fore.LIGHTRED_EX}Resposta da IA: {assistant_message}{Style.RESET_ALL}\n")
-                            history.append({"role": "assistant", "content": assistant_message})
-                            # Sintetizar e reproduzir a resposta
-                            self._speak_response(assistant_message)
-                            if TIME_CHECK:
-                                print(f"\n{Fore.YELLOW}{self.metrics.report()}{Style.RESET_ALL}")
-                                # Generate and save the chart
-                                metrics_data = self.metrics.get_metrics_dict()
-                                chart_file = generate_performance_chart(metrics_data)
-                                print(f"{Fore.GREEN}Performance chart saved as: {chart_file}{Style.RESET_ALL}")
-                        else:
-                            print(f"Erro na API: Status {response.status_code}")
-                            print(f"Detalhes do erro: {response.text}")
-                            
-                    except Exception as e:
-                        print(f"Erro ao comunicar com a API: {e}")
-                        print(f"Tipo do erro: {type(e)}")
-                    
-            elif response.status_code == 403:
-                print(f"{Fore.RED}Erro de autenticação com o servidor STT. Session ID: {self.stt_server.session_id}{Style.RESET_ALL}")
-            else:
-                print(f"{Fore.RED}Erro no servidor STT: {response.status_code}{Style.RESET_ALL}")
-                
-        except Exception as e:
-            print(f"Erro ao comunicar com servidor STT: {e}")
-
 
     async def _speak_response(self, text):
         """Non-blocking speech synthesis"""
@@ -383,7 +338,7 @@ class VoiceRecorder:
                 async with session.post(
                     TTS_SYNTHESIS_URL,
                     json={"text": text},
-                    timeout=aiohttp.ClientTimeout(total=30)
+                    timeout=aiohttp.ClientTimeout(total=100)
                 ) as response:
                     if response.status == 200:
                         result = await response.json()
@@ -398,21 +353,27 @@ class VoiceRecorder:
         except Exception as e:
             print(f"{Fore.RED}Erro na síntese de voz: {str(e)}{Style.RESET_ALL}")
 
-    async def process_ai_turn(self, prompt_text):
+    async def process_ai_response(self, prompt_text):
         try:
             if TIME_CHECK:
                 ai_start = perf_counter()
                 
+            # Get relevant memories asynchronously
+            memory_context = await self.memory_manager.get_relevant_context_async(prompt_text)
+            
+            enhanced_prompt = f"{prompt_text}\n{memory_context if memory_context else ''}{COMMON_INSTRUCTION}"
+            
             async with aiohttp.ClientSession() as session:
                 headers = {"Content-Type": "application/json"}
                 if self.api_config["api_type"] == "openai":
                     headers["Authorization"] = f"Bearer {self.api_config['openai_api']['api_key']}"
 
                 data = {
-                    "messages": [{"role": "user", "content": prompt_text + COMMON_INSTRUCTION}],
+                    "messages": [{"role": "user", "content": enhanced_prompt}],
                     "model": self.api_config["openai_api"]["model"] if self.api_config["api_type"] == "openai" else self.api_config["local_api"]["model"],
                 }
 
+                # Run AI request and speech synthesis concurrently
                 async with session.post(
                     self.api_url,
                     headers=headers,
@@ -427,13 +388,17 @@ class VoiceRecorder:
                             self.metrics.ai_time = perf_counter() - ai_start
                             
                         print(f"{Fore.LIGHTRED_EX}Resposta da AI: {ai_response}{Style.RESET_ALL}")
-                        await self._speak_response(ai_response)
                         
-                        # Exibir métricas apenas uma vez, após todo o processo
+                        # Store memory and generate speech concurrently
+                        await asyncio.gather(
+                            self.memory_manager.add_dialog_memory_async(prompt_text, ai_response),
+                            self._speak_response(ai_response)
+                        )
+                        
                         if TIME_CHECK:
                             print(f"\n{Fore.YELLOW}{self.metrics.report()}{Style.RESET_ALL}")
                             metrics_data = self.metrics.get_metrics_dict()
-                            chart_file = generate_performance_chart(metrics_data)
+                            chart_file = await generate_performance_chart_async(metrics_data)
                             print(f"{Fore.GREEN}Performance chart saved as: {chart_file}{Style.RESET_ALL}")
                     else:
                         print(f"Erro no prompt da AI: {response.status}")
@@ -442,7 +407,10 @@ class VoiceRecorder:
 
     def cleanup(self):
         print("\nFinalizando conexões...")
-        asyncio.run(self._async_cleanup())
+        self.run_async(self._async_cleanup())
+        self.loop.close()
+        if hasattr(self, '_session'):
+            self.run_async(self._session.close())
 
     async def _async_cleanup(self):
         """Simplified cleanup"""
@@ -468,77 +436,91 @@ def save_performance_log(metrics_data, log_filename):
     with open(log_filename, 'a', encoding='utf-8') as f:
         f.write(log_entry)
 
-def generate_performance_chart(metrics_data):
-    # Create data for the chart
-    times = [
-        metrics_data['stt_time'],
-        metrics_data['ai_time'],
-        metrics_data['tts_time'],
-        metrics_data['total_time']
-    ]
-    labels = [
-        f'STT\n({metrics_data["models"]["stt_model"]})',
-        f'AI\n({metrics_data["models"]["ai_model"]})',
-        f'TTS\n({metrics_data["models"]["tts_model"]})',
-        'Total\nTime'
-    ]
+async def generate_performance_chart_async(metrics_data):
+    """Asynchronous version of chart generation"""
+    def create_chart():
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = 'performance_charts'
+        os.makedirs(output_dir, exist_ok=True)
+        chart_filename = os.path.join(output_dir, f'performance_metrics_{timestamp}.jpg')
+        # Create data for the chart
+        times = [
+            metrics_data['stt_time'],
+            metrics_data['ai_time'],
+            metrics_data['tts_time'],
+            metrics_data['total_time']
+        ]
+        labels = [
+            f'STT\n({metrics_data["models"]["stt_model"]})',
+            f'AI\n({metrics_data["models"]["ai_model"]})',
+            f'TTS\n({metrics_data["models"]["tts_model"]})',
+            'Total\nTime'
+        ]
 
-    # Create the bar chart with more width for all columns
-    plt.figure(figsize=(12, 6))
-    bars = plt.bar(labels, times)
-    
-    # Customize the chart
-    plt.title('Performance Metrics by Component')
-    plt.ylabel('Time (seconds)')
-    plt.ylim(0, metrics_data['total_time'] * 1.1)
+        # Create the bar chart with more width for all columns
+        plt.figure(figsize=(12, 6))
+        bars = plt.bar(labels, times)
+        
+        # Customize the chart
+        plt.title('Performance Metrics by Component')
+        plt.ylabel('Time (seconds)')
+        plt.ylim(0, metrics_data['total_time'] * 1.1)
 
-    # Color the total time bar differently
-    bars[-1].set_color('lightgray')
-    
-    # Add value labels on top of bars
-    for bar in bars:
-        height = bar.get_height()
-        plt.text(bar.get_x() + bar.get_width()/2., height,
+        # Color the total time bar differently
+        bars[-1].set_color('lightgray')
+        
+        # Add value labels on top of bars
+        for bar in bars:
+            height = bar.get_height()
+            plt.text(bar.get_x() + bar.get_width()/2., height,
                 f'{height:.2f}s',
                 ha='center', va='bottom')
 
-    # Save the chart
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = 'performance_charts'
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Save log file
-    log_filename = os.path.join(output_dir, 'performance_log.txt')
-    save_performance_log(metrics_data, log_filename)
-    
-    # Save chart
-    chart_filename = os.path.join(output_dir, f'performance_metrics_{timestamp}.jpg')
-    plt.savefig(chart_filename, dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    return chart_filename
+        # Save the chart
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = 'performance_charts'
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Save log file
+        log_filename = os.path.join(output_dir, 'performance_log.txt')
+        save_performance_log(metrics_data, log_filename)
+        
+        # Save chart
+        chart_filename = os.path.join(output_dir, f'performance_metrics_{timestamp}.jpg')
+        plt.savefig(chart_filename, dpi=300, bbox_inches='tight')
+        plt.close()
+        return chart_filename
+
+    # Run chart generation in thread pool to avoid blocking
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, create_chart)
 
 def main():
-    recorder = VoiceRecorder()
+    recorder = MainLoop()
     
     def on_press(key):
         if hasattr(key, 'vk') and key.vk == 96:  # 96 é o código virtual key do '0' do teclado numérico
             if not recorder.is_recording:
                 recorder.start_recording()
 
-    def on_release(key):
+    async def on_release(key):
         if key == keyboard.Key.esc:
             recorder.cleanup()  # Adicionar cleanup antes de sair
             return False
         if hasattr(key, 'vk') and key.vk == 96:  # 96 é o código virtual key do '0' do teclado numérico
             if recorder.is_recording:
-                asyncio.run(recorder.stop_recording())
+                await recorder.quick_answer_loop()
 
     try:
-        with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
+        with keyboard.Listener(
+            on_press=on_press, 
+            on_release=lambda key: recorder.run_async(on_release(key))
+        ) as listener:
             listener.join()
+    except Exception as e:
+        print(f"Error in main loop: {e}")
     finally:
-        recorder.cleanup()  # Garantir que cleanup seja chamado mesmo em caso de erro
+        recorder.cleanup()
 
 if __name__ == "__main__":
     main()
