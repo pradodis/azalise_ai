@@ -5,6 +5,11 @@ import io
 import wave
 import pyaudio
 import requests
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 import time
 import uuid  # Add at top of file with other imports
 from TTS.api import TTS
@@ -20,6 +25,7 @@ from core.async_server_connection import AsyncServerConnection
 import asyncio
 import aiohttp
 from core.memory_manager import MemoryManager
+from core.mother_brain_server import MotherBrain  # Add this import
 
 history = []
 
@@ -49,18 +55,21 @@ class PerformanceMetrics:
         self.stt_time = 0
         self.ai_time = 0
         self.tts_time = 0
+        self.memory_time = 0  # Add memory timing
         self.model_info = {
             'stt_model': STT_CONFIG["engine"] + " - " + STT_CONFIG["whisper"]["model"] if STT_CONFIG["engine"] == "whisper" else STT_CONFIG["engine"], 
             'ai_model': 'GPT-3.5' if API_CONFIG["api_type"] == "openai" else API_CONFIG.get('local_api', {}).get('model', 'Unknown'),
-            'tts_model': TTS_CONFIG["engine"]
+            'tts_model': TTS_CONFIG["engine"],
+            'memory_mode': MEMORY_CONFIG["method"]
         }
     
     def report(self):
         return f"""Performance Metrics:
+        🧠 Memory Time: {self.memory_time:.2f}s
         🗣️ STT Time: {self.stt_time:.2f}s
         🤖 AI Response Time: {self.ai_time:.2f}s
         🔊 TTS Time: {self.tts_time:.2f}s
-        ⌚ Total Time: {(self.stt_time + self.ai_time + self.tts_time):.2f}s
+        ⌚ Total Time: {(self.memory_time + self.stt_time + self.ai_time + self.tts_time):.2f}s
         """
     
     def get_metrics_dict(self):
@@ -156,7 +165,22 @@ class MainLoop:
         asyncio.run(self.initialize_connections())
         
         self.metrics = PerformanceMetrics()
-        self.memory_manager = MemoryManager()
+        
+        # Initialize memory system based on config
+        if MEMORY_CONFIG["method"] == "redis":
+            try:
+                self.memory_system = MotherBrain()
+                asyncio.run(self.memory_system.initialize())
+                print(f"{Fore.GREEN}Redis memory system initialized{Style.RESET_ALL}")
+            except Exception as e:
+                print(f"{Fore.YELLOW}Failed to initialize Redis memory, falling back to simple memory: {e}{Style.RESET_ALL}")
+                self.memory_system = MemoryManager()
+        else:
+            self.memory_system = MemoryManager()
+
+        self.memory_lock = asyncio.Lock()  # Add lock for memory operations
+        print(f"{Fore.GREEN}Memory system initialized in {MEMORY_CONFIG['method']} mode{Style.RESET_ALL}")
+
         print(f"{Fore.GREEN}Sistema inicializado com modo de memória: {MEMORY_CONFIG['method']}{Style.RESET_ALL}")
 
         print(f"{Fore.GREEN}Sistema inicializado com sucesso!{Style.RESET_ALL}")
@@ -229,8 +253,9 @@ class MainLoop:
             print("Nenhum áudio gravado")
             return None
 
+        wav_buffer = None
         try:
-            # Create WAV data in memory with buffer size 256
+            # Create WAV data in memory
             wav_buffer = io.BytesIO()
             with wave.open(wav_buffer, 'wb') as wav_file:
                 wav_file.setnchannels(self.CHANNELS)
@@ -238,9 +263,14 @@ class MainLoop:
                 wav_file.setframerate(self.RATE)
                 wav_file.writeframes(b''.join(self.audio_data))
             
+            # Important: Reset buffer position
+            wav_buffer.seek(0)
             return wav_buffer
+            
         except Exception as e:
             print(f"{Fore.RED}Erro ao processar áudio: {str(e)}{Style.RESET_ALL}")
+            if wav_buffer:
+                wav_buffer.close()
             return None
 
     async def send_audio_to_STT(self, wav_buffer) -> None:
@@ -255,62 +285,60 @@ class MainLoop:
         retry_delay = 1
 
         try:
-            if not hasattr(self, '_session'):
-                self._session = aiohttp.ClientSession()
-
             headers = {
                 'Content-Type': 'audio/wav',
                 'X-Session-ID': self.stt_server.session_id,
                 'Accept-Encoding': 'gzip, deflate'
             }
             
-            wav_buffer.seek(0)
+            # Importante: Crie uma cópia dos dados do buffer
+            audio_data = wav_buffer.getvalue()
             
             for attempt in range(max_retries):
                 try:
-                    async with self._session.post(
-                        f"{STT_SERVER_URL}/transcribe",
-                        data=wav_buffer.getvalue(),
-                        headers=headers,
-                        timeout=aiohttp.ClientTimeout(total=30)
-                    ) as response:
-                        if response.status == 200:
-                            result = await response.json()
-                            if result.get("success"):
-                                transcription = result.get("text", "").strip()
-                                print(f"{Fore.LIGHTBLUE_EX}Você disse: {transcription}{Style.RESET_ALL}")
+                    async with aiohttp.ClientSession() as session:  # Criar nova sessão para cada tentativa
+                        async with session.post(
+                            f"{STT_SERVER_URL}/transcribe",
+                            data=audio_data,  # Usar a cópia dos dados
+                            headers=headers,
+                            timeout=aiohttp.ClientTimeout(total=30)
+                        ) as response:
+                            if response.status == 200:
+                                result = await response.json()
+                                if result.get("success"):
+                                    transcription = result.get("text", "").strip()
+                                    print(f"{Fore.LIGHTBLUE_EX}Você disse: {transcription}{Style.RESET_ALL}")
+                                    
+                                    if TIME_CHECK:
+                                        self.metrics.stt_time = perf_counter() - stt_start
+                                        
+                                    if "model" in result:
+                                        self.metrics.model_info['stt_model'] = f"Whisper {result['model']}"
+                                        
+                                    return transcription if transcription else None
                                 
-                                if TIME_CHECK:
-                                    self.metrics.stt_time = perf_counter() - stt_start
-                                    
-                                if "model" in result:
-                                    self.metrics.model_info['stt_model'] = f"Whisper {result['model']}"
-                                    
-                                return transcription if transcription else None
-                            
-                            print(f"{Fore.RED}Falha na transcrição: {result.get('error')}{Style.RESET_ALL}")
+                                print(f"{Fore.RED}Falha na transcrição: {result.get('error')}{Style.RESET_ALL}")
+                                return None
+
+                            if response.status in {429} or 500 <= response.status < 600:
+                                if attempt < max_retries - 1:
+                                    wait_time = retry_delay * (attempt + 1)
+                                    print(f"{Fore.YELLOW}Tentativa {attempt + 1} falhou, aguardando {wait_time}s...{Style.RESET_ALL}")
+                                    await asyncio.sleep(wait_time)
+                                    continue
+                                
+                            error_text = await response.text()
+                            print(f"{Fore.RED}Erro na requisição STT (Status {response.status}): {error_text}{Style.RESET_ALL}")
                             return None
 
-                        # Se receber 429 (Too Many Requests) ou 5xx, tenta novamente
-                        if response.status in {429} or 500 <= response.status < 600:
-                            if attempt < max_retries - 1:
-                                wait_time = retry_delay * (attempt + 1)
-                                print(f"{Fore.YELLOW}Tentativa {attempt + 1} falhou, aguardando {wait_time}s...{Style.RESET_ALL}")
-                                await asyncio.sleep(wait_time)
-                                continue
-                            
-                        error_text = await response.text()
-                        print(f"{Fore.RED}Erro na requisição STT: {response.status}")
-                        print(f"Detalhes do erro: {error_text}{Style.RESET_ALL}")
-                        return None
-
-                except asyncio.TimeoutError:
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                     if attempt < max_retries - 1:
                         wait_time = retry_delay * (attempt + 1)
-                        print(f"{Fore.YELLOW}Timeout na tentativa {attempt + 1}, aguardando {wait_time}s...{Style.RESET_ALL}")
+                        print(f"{Fore.YELLOW}Erro de conexão na tentativa {attempt + 1}: {str(e)}, aguardando {wait_time}s...{Style.RESET_ALL}")
                         await asyncio.sleep(wait_time)
                         continue
-                    raise
+                    print(f"{Fore.RED}Todas as tentativas falharam. Último erro: {str(e)}{Style.RESET_ALL}")
+                    return None
 
         except Exception as e:
             print(f"{Fore.RED}Erro ao processar áudio: {str(e)}{Style.RESET_ALL}")
@@ -354,15 +382,41 @@ class MainLoop:
             print(f"{Fore.RED}Erro na síntese de voz: {str(e)}{Style.RESET_ALL}")
 
     async def process_ai_response(self, prompt_text):
+        if not prompt_text:
+            print(f"{Fore.YELLOW}No text to process{Style.RESET_ALL}")
+            return
+
         try:
             if TIME_CHECK:
                 ai_start = perf_counter()
-                
-            # Get relevant memories asynchronously
-            memory_context = await self.memory_manager.get_relevant_context_async(prompt_text)
-            
-            enhanced_prompt = f"{prompt_text}\n{memory_context if memory_context else ''}{COMMON_INSTRUCTION}"
-            
+                memory_start = perf_counter()
+
+            # Get memory and personality context
+            memory_context = ""
+            personality_data = None
+            async with self.memory_lock:
+                try:
+                    # Fazer chamadas paralelas para memória e personalidade
+                    responses = await asyncio.gather(
+                        self.memory_system.get_relevant_context_async(prompt_text),
+                        self.memory_system.get_personality()
+                    )
+                    memory_context = responses[0]
+                    personality_data = responses[1]
+                except Exception as e:
+                    print(f"{Fore.YELLOW}Context retrieval error: {e}{Style.RESET_ALL}")
+
+            # Format the enhanced prompt with actual context
+            enhanced_prompt = COMMON_INSTRUCTION.format(
+                personality_context=personality_data.get('personality_context', 'Sem dados de personalidade disponíveis') if personality_data else '',
+                mood_context=personality_data.get('mood_context', 'Sem dados de humor disponíveis') if personality_data else ''
+            )
+            enhanced_prompt += f"\nPrevious context: {memory_context}\nCurrent input: {prompt_text}"
+
+            # Debug print for enhanced prompt
+            print(f"{Fore.MAGENTA}Enhanced prompt: {enhanced_prompt}{Style.RESET_ALL}")
+
+            # AI request with enhanced prompt
             async with aiohttp.ClientSession() as session:
                 headers = {"Content-Type": "application/json"}
                 if self.api_config["api_type"] == "openai":
@@ -389,10 +443,11 @@ class MainLoop:
                             
                         print(f"{Fore.LIGHTRED_EX}Resposta da AI: {ai_response}{Style.RESET_ALL}")
                         
-                        # Store memory and generate speech concurrently
+                        # Store memory and generate speech concurrently, plus analyze interaction
                         await asyncio.gather(
-                            self.memory_manager.add_dialog_memory_async(prompt_text, ai_response),
-                            self._speak_response(ai_response)
+                            self.memory_system.add_dialog_memory_async(prompt_text, ai_response),
+                            self._speak_response(ai_response),
+                            self.memory_system.analyze_interaction(prompt_text, ai_response)
                         )
                         
                         if TIME_CHECK:
@@ -403,7 +458,21 @@ class MainLoop:
                     else:
                         print(f"Erro no prompt da AI: {response.status}")
         except Exception as e:
-            print(f"Erro ao processar prompt da AI: {e}")
+            print(f"{Fore.RED}Error in AI response processing: {str(e)}{Style.RESET_ALL}")
+            logger.error(f"AI response error: {str(e)}", exc_info=True)
+
+    async def _store_memory(self, prompt_text, ai_response):
+        """Asynchronous memory storage with timeout"""
+        try:
+            async with self.memory_lock:
+                await asyncio.wait_for(
+                    self.memory_system.add_dialog_memory_async(prompt_text, ai_response),
+                    timeout=0.1
+                )
+        except asyncio.TimeoutError:
+            print(f"{Fore.YELLOW}Memory storage timed out{Style.RESET_ALL}")
+        except Exception as e:
+            print(f"{Fore.YELLOW}Memory storage error: {e}{Style.RESET_ALL}")
 
     def cleanup(self):
         print("\nFinalizando conexões...")
@@ -413,11 +482,16 @@ class MainLoop:
             self.run_async(self._session.close())
 
     async def _async_cleanup(self):
-        """Simplified cleanup"""
-        await asyncio.gather(
+        """Enhanced cleanup with memory system"""
+        cleanup_tasks = [
             self.tts_server.disconnect(),
             self.stt_server.disconnect()
-        )
+        ]
+        
+        if hasattr(self.memory_system, 'cleanup'):
+            cleanup_tasks.append(self.memory_system.cleanup())
+            
+        await asyncio.gather(*cleanup_tasks)
 
     def __del__(self):
         self.cleanup()

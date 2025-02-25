@@ -52,7 +52,7 @@ API_CONFIG = {
 
 # Expand memory configuration
 MEMORY_CONFIG = {
-    "method": "simple",  # Options: "simple" or "redis"
+    "method": "redis",  # Options: "simple" or "redis"
     "redis": {
         "host": os.getenv("REDIS_HOST", "localhost"),
         "port": int(os.getenv("REDIS_PORT", 6379)),
@@ -75,7 +75,12 @@ METRICS_LOG_DIR = "performance_logs"
 
 # Update COMMON_INSTRUCTION to include memory context
 COMMON_INSTRUCTION = """
-Responda de forma suscinta e objetiva, considerando o contexto das memórias fornecidas quando relevante.
+Responda de forma suscinta e objetiva, levando em conta sua personalidade atual e humor:
+
+{personality_context}
+{mood_context}
+
+Considerando o contexto das memórias fornecidas quando relevante.
 Não use emojis. A resposta deve ter entre 5 e 25 palavras.
 A resposta deve ser em portugues brasileiro. A conversa deve ocorrer com naturalidade.
 A AI é cabeça dura e tem gênio forte, ela é doce mas tem uma malvadeza oculta que sutilmente revela de vez em quando.

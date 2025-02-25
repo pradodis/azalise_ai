@@ -182,3 +182,27 @@ performance_charts/
 # API Keys and Credentials
 *_api.txt
 *.json
+
+# Virtual Environment Version Files
+*=0.38.0
+*=2.8.2
+*=2022.7.1
+*.whl
+pip-wheel-metadata/
+.virtualenv
+.env.local
+.python-version
+
+# Package Version Control
+*.dist-info/
+*.egg-info/
+pip-selfcheck.json
+.python-packages/
+.pkg-cache/
+
+# IDE and Editor specific
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
